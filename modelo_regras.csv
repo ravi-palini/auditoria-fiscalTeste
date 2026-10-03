@@ -1,0 +1,2 @@
+ncm_prefixo,tributo,tratamento,regime,aliquota_esperada,cst_esperados,base_legal,vigencia_inicio,vigencia_fim,validada,descricao
+3004,PIS_COFINS,MONOFASICO,TODOS,0,04,"Lei 10.147/2000, art. 1º (troque pela base confirmada pelo contador)",2000-12-22,,nao,Exemplo de linha: só coloque "sim" em validada depois da conferência do contador

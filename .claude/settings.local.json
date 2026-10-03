@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk ls *)",
+      "Bash(rtk find *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk docker *)",
+      "Bash(chmod +x /home/sn0w/Projetos/job/auditoria_fiscal_kit/iniciar_gui.sh)",
+      "Bash(chmod +x /home/sn0w/Projetos/job/auditoria_fiscal_kit/gerar_chave_secreta.sh)",
+      "Bash(./iniciar_gui.sh start *)"
+    ]
+  }
+}

@@ -1,0 +1,504 @@
+{
+  "name": "Auditoria Fiscal - NF-e",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "receber-xml",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "name": "Webhook (Entrada)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        -900,
+        -400
+      ],
+      "webhookId": "97e5b87e-ca1b-4a37-b0a4-5deb84a80605",
+      "id": "37396576-5617-4e26-b4c4-9d6780ea9ec5"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.body;\nif (!raw || typeof raw !== 'object') {\n  throw new Error('O corpo da requisição não chegou como XML. Envie com o cabeçalho Content-Type: application/xml.');\n}\n\n// Passa todas as chaves para minúsculas, para não depender de como o n8n converteu o XML\nconst lower = o => Array.isArray(o) ? o.map(lower)\n  : (o && typeof o === 'object')\n    ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k.toLowerCase(), lower(v)]))\n    : o;\n\nconst body = lower(raw);\nconst nfe = body?.nfeproc?.nfe ?? body?.nfe;\nconst inf = nfe?.infnfe;\nif (!inf) throw new Error('XML sem infNFe. Chaves recebidas: ' + Object.keys(body || {}).join(', '));\n\nconst attr = (o, k) => o?.$?.[k] ?? o?.[`@_${k}`] ?? o?.[k];\nconst arr = x => (x == null ? [] : Array.isArray(x) ? x : [x]);\nconst num = v => (v == null || v === '' || isNaN(Number(v)) ? null : Number(v));\n// PIS/COFINS/ICMS têm um subgrupo (pisaliq, pisnt, icms00, icmssn500...) que contém CST e valores\nconst grupo = g => {\n  if (!g || typeof g !== 'object') return {};\n  const k = Object.keys(g).find(k => k !== '$' && typeof g[k] === 'object');\n  return k ? g[k] : {};\n};\n\nconst chave = String(attr(inf, 'id') || '').replace(/^NFe/i, '');\nif (!/^\\d{44}$/.test(chave)) throw new Error('Chave de acesso inválida: \"' + chave + '\"');\n\n// Só aceita nota autorizada (100 = autorizada, 150 = autorizada fora de prazo)\nconst cstat = body?.nfeproc?.protnfe?.infprot?.cstat ?? null;\nif (cstat && !['100', '150'].includes(String(cstat))) {\n  throw new Error('NF-e não autorizada (cStat ' + cstat + '). Nota ignorada.');\n}\n\nconst itens = arr(inf.det).map((d, i) => {\n  const p = d.prod || {};\n  const pis = grupo(d.imposto?.pis);\n  const cof = grupo(d.imposto?.cofins);\n  const icms = grupo(d.imposto?.icms);\n  return {\n    item_numero: Number(attr(d, 'nitem')) || i + 1,\n    produto_original: p.xprod ?? null,\n    ncm: String(p.ncm ?? ''),\n    cfop: p.cfop ?? null,\n    valor_item: num(p.vprod),\n    icms_cst: icms.csosn ?? icms.cst ?? null,\n    icms_valor: num(icms.vicms),\n    pis_cst: pis.cst ?? null,\n    pis_bc: num(pis.vbc),\n    pis_aliquota: num(pis.ppis),\n    pis_valor: num(pis.vpis),\n    cofins_cst: cof.cst ?? null,\n    cofins_bc: num(cof.vbc),\n    cofins_aliquota: num(cof.pcofins),\n    cofins_valor: num(cof.vcofins)\n  };\n});\n\nreturn [{\n  json: {\n    chave_acesso: chave,\n    cnpj_emitente: inf.emit?.cnpj ?? null,\n    cnpj_destinatario: inf.dest?.cnpj ?? null,\n    numero: inf.ide?.nnf ? String(inf.ide.nnf) : null,\n    crt: inf.emit?.crt != null ? String(inf.emit.crt) : null,\n    tp_amb: inf.ide?.tpamb != null ? String(inf.ide.tpamb) : null,\n    data_emissao: String(inf.ide?.dhemi ?? inf.ide?.demi ?? '').slice(0, 10) || null,\n    xml_bruto: JSON.stringify(raw),\n    itens\n  }\n}];"
+      },
+      "name": "Extrair NF-e",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        -400
+      ],
+      "id": "21718aef-17ce-4cc9-94db-fe798f994990"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COALESCE((SELECT json_agg(r ORDER BY length(r.ncm_prefixo) DESC) FROM regra_fiscal r), '[]'::json) AS regras,\n  COALESCE((SELECT json_agg(c) FROM cliente c), '[]'::json) AS clientes;",
+        "options": {}
+      },
+      "name": "Buscar Regras",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -460,
+        -400
+      ],
+      "id": "2f37fb80-3b0f-4f3b-ad88-09d5e7285535",
+      "credentials": {
+        "postgres": {
+          "id": "uL7viB15shXsFXx8",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const nota = $('Extrair NF-e').first().json;\nconst { regras = [], clientes = [] } = $input.first().json;\n\n// Quem é o cliente nesta nota?\nconst cEmit = clientes.find(c => c.cnpj === nota.cnpj_emitente);\nconst cDest = clientes.find(c => c.cnpj === nota.cnpj_destinatario);\nconst cliente = cEmit ?? cDest;\nif (!cliente) {\n  throw new Error('Nenhum CNPJ desta nota está cadastrado como cliente (emitente ' + nota.cnpj_emitente +\n    ', destinatário ' + nota.cnpj_destinatario + '). Rode ./cliente_novo.sh antes de enviar as notas.');\n}\nconst papel = cEmit ? 'EMITENTE' : 'DESTINATARIO';\nconst regime = cliente.regime;\nconst simples = regime === 'SIMPLES';\nconst atividade = cliente.atividade || 'COMERCIO';\nconst homologacao = String(nota.tp_amb) === '2';\n\nconst avisos = [];\nif (homologacao) avisos.push('Nota de HOMOLOGAÇÃO (sem valor fiscal): não deve ser usada como achado real.');\nif (papel === 'EMITENTE' && (String(nota.crt) === '1' || String(nota.crt) === '2') !== simples)\n  avisos.push('O regime cadastrado do cliente (' + regime + ') não combina com o CRT da nota (' + nota.crt + '). Confira o cadastro.');\n\nconst n = v => (v == null ? 0 : Number(v));\nconst r2 = v => Math.round(v * 100 + 1e-6) / 100;\nconst TRIBUTADO = ['01', '02'];\nconst NAO_TRIBUTADO = ['04', '05', '06', '07', '08', '09'];\nconst PRIORIDADE = ['POSSIVEL_PAGAMENTO_INDEVIDO', 'DIVERGENTE_REGRA', 'TESE_ICMS_BASE',\n                    'OPORTUNIDADE_SIMPLES', 'CALCULO_DIVERGENTE', 'INCONSISTENCIA'];\n\nconst vigente = r =>\n  (!r.vigencia_inicio || r.vigencia_inicio <= nota.data_emissao) &&\n  (!r.vigencia_fim || r.vigencia_fim >= nota.data_emissao);\n\nconst semRegra = new Map();\n\nconst itens = nota.itens.map(it => {\n  // Nota de COMPRA do cliente: análise de créditos ainda não implementada\n  if (papel !== 'EMITENTE') {\n    return { ...it, achado: 'FORA_ESCOPO', camada: null,\n      detalhe_regra: 'Nota de compra do cliente: a análise de créditos de PIS/COFINS/ICMS ainda não está implementada.',\n      aliquota_esperada: null, base_legal: null, valor_recuperavel: null };\n  }\n\n  const achados = [];\n  const add = (achado, camada, detalhe, valor = null) => achados.push({ achado, camada, detalhe, valor });\n  const pago = n(it.pis_valor) + n(it.cofins_valor);\n\n  // ===== CAMADA 1: verificações universais (só lendo o XML) =====\n  if (!simples) {\n    const tributos = [\n      { nome: 'PIS', cst: it.pis_cst, bc: it.pis_bc, aliq: it.pis_aliquota, valor: it.pis_valor },\n      { nome: 'COFINS', cst: it.cofins_cst, bc: it.cofins_bc, aliq: it.cofins_aliquota, valor: it.cofins_valor }\n    ];\n    let teseIcms = 0;\n    for (const t of tributos) {\n      if (TRIBUTADO.includes(t.cst) && n(t.valor) === 0)\n        add('INCONSISTENCIA', 1, `${t.nome}: CST ${t.cst} (tributável) com valor zerado.`);\n      if (NAO_TRIBUTADO.includes(t.cst) && n(t.valor) > 0)\n        add('POSSIVEL_PAGAMENTO_INDEVIDO', 1, `${t.nome}: CST ${t.cst} (sem tributação) mas com valor destacado de ${t.valor}.`, n(t.valor));\n      if (t.aliq != null && t.bc != null && t.valor != null && Math.abs(t.bc * t.aliq / 100 - t.valor) > 0.02)\n        add('CALCULO_DIVERGENTE', 1, `${t.nome}: valor ${t.valor} não bate com base ${t.bc} x alíquota ${t.aliq}%.`);\n      // Tese: ICMS dentro da base do PIS/COFINS (STF, RE 574.706 / Tema 69)\n      if (TRIBUTADO.includes(t.cst) && n(it.icms_valor) > 0 && t.bc != null && t.aliq != null &&\n          it.valor_item != null && t.bc >= it.valor_item - 0.02)\n        teseIcms += n(it.icms_valor) * t.aliq / 100;\n    }\n    if (teseIcms > 0)\n      add('TESE_ICMS_BASE', 1,\n        `ICMS destacado de ${n(it.icms_valor)} parece não ter sido excluído da base de PIS/COFINS (base ${it.pis_bc} = valor do item). Tese: exclusão do ICMS da base. Validar com tributarista.`,\n        r2(teseIcms));\n  } else {\n    // Cliente do Simples Nacional: ICMS-ST já pago na compra (CSOSN 500)\n    if (String(it.icms_cst) === '500')\n      add('OPORTUNIDADE_SIMPLES', 1,\n        'Venda com ICMS-ST já recolhido anteriormente (CSOSN 500): verificar se a receita foi segregada (sem a parcela de ICMS) no PGDAS-D.');\n  }\n\n  // ===== CAMADA 2: regra por NCM, considerando o regime do cliente =====\n  const regra = regras.find(r =>\n    r.tributo === 'PIS_COFINS' &&\n    it.ncm.startsWith(r.ncm_prefixo) &&\n    (!r.regime || r.regime === 'TODOS' || r.regime === regime) &&\n    vigente(r)\n  );\n\n  if (regra) {\n    const aviso = regra.validada ? '' : ' (regra ainda NÃO validada por contador)';\n    const trat = regra.tratamento;\n    const csts = (regra.cst_esperados || '').split(',').map(s => s.trim()).filter(Boolean);\n    const aplica = trat === 'ALIQ_ZERO' || (trat === 'MONOFASICO' && atividade === 'COMERCIO');\n\n    if (aplica && !simples && pago > 0)\n      add('DIVERGENTE_REGRA', 2,\n        `NCM ${it.ncm}: tratamento ${trat}, mas houve PIS/COFINS de ${pago.toFixed(2)} na nota.${aviso}`, r2(pago));\n    if (aplica && !simples && csts.length && !csts.includes(String(it.pis_cst)))\n      add('DIVERGENTE_REGRA', 2, `NCM ${it.ncm}: CST ${it.pis_cst} fora do esperado (${csts.join(', ')}).${aviso}`);\n    if (aplica && simples)\n      add('OPORTUNIDADE_SIMPLES', 2,\n        `NCM ${it.ncm} com tratamento ${trat}: cliente do Simples deve segregar essa receita (sem PIS/COFINS) no PGDAS-D. Conferir.${aviso}`);\n  } else if (!homologacao) {\n    semRegra.set(it.ncm, it.produto_original);\n  }\n\n  const achado = PRIORIDADE.find(p => achados.some(a => a.achado === p)) ?? (regra ? 'CONFORME' : 'SEM_REGRA');\n  const principal = achados.find(a => a.achado === achado);\n  // Soma só os valores do achado principal (PIS + COFINS), sem misturar tipos diferentes (evita contar duas vezes)\n  const vals = achados.filter(a => a.achado === achado && a.valor != null).map(a => a.valor);\n  const valorRecuperavel = vals.length ? r2(vals.reduce((s, v) => s + v, 0)) : null;\n\n  return {\n    ...it,\n    achado,\n    camada: principal?.camada ?? (regra ? 2 : null),\n    detalhe_regra: achados.map(a => a.detalhe).join(' | ')\n      || (regra ? 'Sem divergência nas regras aplicáveis.' : 'Nenhuma regra cadastrada para este NCM.'),\n    aliquota_esperada: regra?.aliquota_esperada ?? null,\n    base_legal: regra?.base_legal ?? (achado === 'TESE_ICMS_BASE' ? 'STF, RE 574.706 (Tema 69) — A VALIDAR' : null),\n    valor_recuperavel: valorRecuperavel\n  };\n});\n\nreturn [{\n  json: {\n    ...nota,\n    homologacao,\n    avisos,\n    cliente_cnpj: cliente.cnpj,\n    papel_cliente: papel,\n    ncms_sem_regra: [...semRegra].filter(([ncm]) => ncm).map(([ncm, descricao]) => ({ ncm, descricao })),\n    itens\n  }\n}];"
+      },
+      "name": "Comparar Regras",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        -400
+      ],
+      "id": "260932cb-2d6a-4089-a01d-e33321568638"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3.5-flash-lite",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3.5-flash-lite"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Você redige alertas para um revisor fiscal humano. O achado de cada item já foi calculado por regras de código e NÃO pode ser alterado nem contestado por você. Escreva 1 ou 2 frases objetivas, em português, explicando o achado ao revisor. Não invente leis, artigos, alíquotas ou valores que não estejam nos dados abaixo.\n\nItens (JSON):\n{{ JSON.stringify($json.itens.filter(i => !['CONFORME','SEM_REGRA','FORA_ESCOPO'].includes(i.achado)).slice(0, 100).map(i => ({ item_numero: i.item_numero, produto: i.produto_original, ncm: i.ncm, achado: i.achado, detalhe: i.detalhe_regra, base_legal: i.base_legal, valor_recuperavel: i.valor_recuperavel }))) }}\n\nSe a lista estiver vazia, responda [].\nResponda ESTRITAMENTE um array JSON, sem nenhum texto fora dele:\n[{\"item_numero\": 1, \"alerta_auditoria\": \"texto\"}]"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -20,
+        -400
+      ],
+      "id": "30e2c365-a8db-48ec-937d-c1544ee75e4c",
+      "name": "Message a model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "xkDUBi7TYrYjY9Wg",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const nota = $('Comparar Regras').first().json;\nconst json = $input.first().json;\nlet ia = [];\n\n// Lê a resposta da IA em qualquer formato. Se falhar, os achados das regras continuam valendo.\ntry {\n  if (Array.isArray(json)) ia = json;\n  else if (Array.isArray(json.text)) ia = json.text;\n  else if (Array.isArray(json.output)) ia = json.output;\n  else {\n    let txt = '';\n    if (typeof json.text === 'string') txt = json.text;\n    else if (typeof json.content === 'string') txt = json.content;\n    else if (json.content?.parts?.[0]?.text) txt = json.content.parts[0].text;\n    if (txt) ia = JSON.parse(txt.replace(/```json/gi, '').replace(/```/g, '').trim());\n  }\n  if (!Array.isArray(ia)) ia = [];\n} catch (e) {\n  ia = [];\n}\n\nconst MODELO = 'gemini-3.5-flash-lite';\nconst prefixo = nota.homologacao ? '[NOTA DE HOMOLOGAÇÃO] ' : '';\n\nconst itens = nota.itens.map(it => {\n  const r = ia.find(a => Number(a.item_numero) === it.item_numero);\n  return {\n    item_numero: it.item_numero,\n    produto_original: it.produto_original ?? '(sem descrição)',\n    ncm_analisado: it.ncm,\n    status_tributario: it.achado,\n    alerta_gerado: prefixo + (r?.alerta_auditoria ?? it.detalhe_regra),\n    cst_declarado: it.pis_cst,\n    aliquota_declarada: it.pis_aliquota,\n    aliquota_esperada: it.aliquota_esperada,\n    valor_recuperavel_estimado: it.valor_recuperavel,\n    base_legal: it.base_legal,\n    achado: it.achado,\n    camada: it.camada,\n    detalhe_regra: it.detalhe_regra,\n    resposta_ia_bruta: r ?? null,\n    modelo_ia: r ? MODELO : null\n  };\n});\n\nreturn [{\n  json: {\n    chave_acesso: nota.chave_acesso,\n    cnpj_emitente: nota.cnpj_emitente,\n    cnpj_destinatario: nota.cnpj_destinatario,\n    numero: nota.numero,\n    data_emissao: nota.data_emissao,\n    xml_bruto: nota.xml_bruto,\n    crt: nota.crt,\n    tp_amb: nota.tp_amb,\n    cliente_cnpj: nota.cliente_cnpj,\n    papel_cliente: nota.papel_cliente,\n    homologacao: nota.homologacao,\n    avisos: nota.avisos,\n    ncms_sem_regra: nota.ncms_sem_regra,\n    itens\n  }\n}];"
+      },
+      "name": "Processador de Lote",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        -400
+      ],
+      "id": "09059e16-ad93-4a59-a8ca-64dd1566d261"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH doc AS (\n  INSERT INTO nfe_documento (chave_acesso, cnpj_emitente, cnpj_destinatario, numero, data_emissao, xml_bruto, crt, tp_amb, cliente_cnpj, papel_cliente)\n  SELECT p->>'chave_acesso', p->>'cnpj_emitente', p->>'cnpj_destinatario', p->>'numero',\n         NULLIF(p->>'data_emissao','')::date, p->>'xml_bruto', p->>'crt', p->>'tp_amb',\n         p->>'cliente_cnpj', p->>'papel_cliente'\n  FROM (SELECT $1::jsonb AS p) s\n  ON CONFLICT (chave_acesso) DO UPDATE SET\n    cliente_cnpj = EXCLUDED.cliente_cnpj, papel_cliente = EXCLUDED.papel_cliente\n  RETURNING id\n),\nsug AS (\n  INSERT INTO sugestao_regra_ia (ncm, descricao_exemplo)\n  SELECT s.ncm, s.descricao\n  FROM jsonb_to_recordset($1::jsonb->'ncms_sem_regra') AS s(ncm text, descricao text)\n  WHERE s.ncm ~ '^[0-9]{8}$'\n  ON CONFLICT (ncm) DO NOTHING\n  RETURNING ncm\n),\nins AS (\n  INSERT INTO auditoria_quarentena\n    (nfe_id, item_numero, produto_original, ncm_analisado, status_tributario, alerta_gerado,\n     cst_declarado, aliquota_declarada, aliquota_esperada, valor_recuperavel_estimado, base_legal,\n     achado, camada, detalhe_regra, resposta_ia_bruta, modelo_ia)\n  SELECT doc.id, i.item_numero, i.produto_original, i.ncm_analisado, i.status_tributario, i.alerta_gerado,\n         i.cst_declarado, i.aliquota_declarada, i.aliquota_esperada, i.valor_recuperavel_estimado, i.base_legal,\n         i.achado, i.camada, i.detalhe_regra, i.resposta_ia_bruta, i.modelo_ia\n  FROM doc,\n       jsonb_to_recordset($1::jsonb->'itens') AS i(\n         item_numero int, produto_original text, ncm_analisado text, status_tributario text,\n         alerta_gerado text, cst_declarado text, aliquota_declarada numeric, aliquota_esperada numeric,\n         valor_recuperavel_estimado numeric, base_legal text, achado text, camada smallint,\n         detalhe_regra text, resposta_ia_bruta jsonb, modelo_ia text)\n  ON CONFLICT (nfe_id, item_numero) DO UPDATE SET\n    status_tributario = EXCLUDED.status_tributario, alerta_gerado = EXCLUDED.alerta_gerado,\n    cst_declarado = EXCLUDED.cst_declarado, aliquota_declarada = EXCLUDED.aliquota_declarada,\n    aliquota_esperada = EXCLUDED.aliquota_esperada, valor_recuperavel_estimado = EXCLUDED.valor_recuperavel_estimado,\n    base_legal = EXCLUDED.base_legal, achado = EXCLUDED.achado, camada = EXCLUDED.camada,\n    detalhe_regra = EXCLUDED.detalhe_regra, resposta_ia_bruta = EXCLUDED.resposta_ia_bruta,\n    modelo_ia = EXCLUDED.modelo_ia\n  WHERE auditoria_quarentena.status_revisao = 'PENDENTE_APROVACAO_HUMANA'\n  RETURNING id\n)\nSELECT (SELECT id FROM doc) AS nfe_id, (SELECT count(*) FROM ins) AS itens_gravados;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "name": "Gravar no Banco",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        420,
+        -400
+      ],
+      "id": "b6d72d0b-7f8e-4922-b3c9-cf42e941c730",
+      "credentials": {
+        "postgres": {
+          "id": "uL7viB15shXsFXx8",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const nota = $('Processador de Lote').first().json;\nconst db = $input.first().json;\nconst por_achado = {};\nlet total = 0;\nfor (const i of nota.itens) {\n  por_achado[i.achado] = (por_achado[i.achado] || 0) + 1;\n  total += Number(i.valor_recuperavel_estimado) || 0;\n}\nreturn [{\n  json: {\n    status: 'ok',\n    chave_acesso: nota.chave_acesso,\n    cliente_cnpj: nota.cliente_cnpj,\n    papel_cliente: nota.papel_cliente,\n    homologacao: nota.homologacao,\n    itens_na_nota: nota.itens.length,\n    itens_gravados: Number(db.itens_gravados ?? 0),\n    achados: por_achado,\n    valor_estimado_total: Math.round(total * 100) / 100,\n    ncms_sem_regra: (nota.ncms_sem_regra || []).length,\n    avisos: nota.avisos\n  }\n}];"
+      },
+      "name": "Resumo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        -400
+      ],
+      "id": "0bc17510-7313-4e5d-b436-c70fcbd4ffec"
+    },
+    {
+      "parameters": {
+        "formTitle": "Revisão de achados fiscais",
+        "formDescription": "Informe o(s) ID(s) do achado (coluna \"id\" no Metabase), a decisão e seu nome.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "IDs dos achados (separados por vírgula)",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Decisão",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "APROVADO"
+                  },
+                  {
+                    "option": "REJEITADO"
+                  },
+                  {
+                    "option": "AJUSTADO"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Seu nome",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Observação"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Formulário de Revisão",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        -900,
+        0
+      ],
+      "webhookId": "0dc6e29b-c606-499e-bc4e-63911dd9c8b7",
+      "id": "3c1a1994-3afe-43d6-b018-e856bc61d3f0"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE auditoria_quarentena\nSET status_revisao = $2, revisado_por = $3, revisado_em = now(), observacao_revisao = NULLIF($4, '')\nWHERE id = ANY(string_to_array(regexp_replace($1, '\\s', '', 'g'), ',')::int[])\nRETURNING id, status_revisao;",
+        "options": {
+          "queryReplacement": "={{ [$json[\"IDs dos achados (separados por vírgula)\"], $json[\"Decisão\"], $json[\"Seu nome\"], $json[\"Observação\"] ?? ''] }}"
+        }
+      },
+      "name": "Registrar Revisão",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -680,
+        0
+      ],
+      "id": "c11e9c80-1bc1-45fe-939b-05bdc8e8f816",
+      "credentials": {
+        "postgres": {
+          "id": "uL7viB15shXsFXx8",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 3
+            }
+          ]
+        }
+      },
+      "name": "Toda madrugada",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        400
+      ],
+      "id": "24c9088f-091f-4c79-a1ba-3f567fcb6639"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ncm, descricao_exemplo FROM sugestao_regra_ia WHERE status = 'PENDENTE' ORDER BY criado_em LIMIT 25;",
+        "options": {}
+      },
+      "name": "Buscar NCMs pendentes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        -680,
+        400
+      ],
+      "id": "c5f408c9-f594-4811-9f1a-a6a642987a96",
+      "credentials": {
+        "postgres": {
+          "id": "uL7viB15shXsFXx8",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const pend = $input.all().map(i => i.json).filter(r => r.ncm);\nreturn [{ json: { ncms: pend.map(r => ({ ncm: r.ncm, descricao: r.descricao_exemplo })) } }];"
+      },
+      "name": "Montar lote",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        400
+      ],
+      "id": "7b2094da-a463-41ab-ab2f-a514b81097d7"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-3.5-flash-lite",
+          "mode": "list",
+          "cachedResultName": "models/gemini-3.5-flash-lite"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Você apoia um contador tributarista. Para cada NCM e descrição de produto abaixo, indique o tratamento de PIS/COFINS mais provável no Brasil. Isto é apenas uma SUGESTÃO para triagem e será conferida por um humano. Se não tiver certeza, use INCERTO e deixe a base legal vazia. Não invente artigos nem leis.\n\nNCMs (JSON):\n{{ JSON.stringify($json.ncms) }}\n\nResponda ESTRITAMENTE um array JSON, sem nenhum texto fora dele:\n[{\"ncm\": \"00000000\", \"tratamento_provavel\": \"MONOFASICO | ALIQ_ZERO | SUBSTITUICAO_TRIBUTARIA | TRIBUTADO | INCERTO\", \"confianca\": \"ALTA | MEDIA | BAIXA\", \"justificativa\": \"1 frase\", \"base_legal_provavel\": \"texto ou vazio\"}]"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        400
+      ],
+      "id": "2eae2b7c-771a-48bc-b79f-ec8d4e298836",
+      "name": "Sugerir regras",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "xkDUBi7TYrYjY9Wg",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const json = $input.first().json;\nlet ia = [];\ntry {\n  if (Array.isArray(json)) ia = json;\n  else if (Array.isArray(json.text)) ia = json.text;\n  else if (Array.isArray(json.output)) ia = json.output;\n  else {\n    let txt = '';\n    if (typeof json.text === 'string') txt = json.text;\n    else if (typeof json.content === 'string') txt = json.content;\n    else if (json.content?.parts?.[0]?.text) txt = json.content.parts[0].text;\n    if (txt) ia = JSON.parse(txt.replace(/```json/gi, '').replace(/```/g, '').trim());\n  }\n  if (!Array.isArray(ia)) ia = [];\n} catch (e) {\n  ia = [];\n}\nconst pedidos = new Set($('Montar lote').first().json.ncms.map(x => x.ncm));\nconst validos = ia.filter(s => s && pedidos.has(String(s.ncm)));\n// Se a IA não devolveu nada utilizável, não devolve itens: o fluxo para e os NCMs continuam PENDENTES.\nreturn validos.map(s => ({ json: { ncm: String(s.ncm), resposta: s } }));"
+      },
+      "name": "Ler sugestões",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        400
+      ],
+      "id": "c7ed205f-cae9-4e9f-b67d-c7e2e9ae5beb"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE sugestao_regra_ia SET status = 'SUGERIDA', resposta_ia = $1::jsonb, atualizado_em = now() WHERE ncm = $2 RETURNING ncm;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.resposta), $json.ncm] }}"
+        }
+      },
+      "name": "Gravar sugestões",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        200,
+        400
+      ],
+      "id": "001920ff-4575-484c-a6f5-00d1490dc5a9",
+      "credentials": {
+        "postgres": {
+          "id": "uL7viB15shXsFXx8",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook (Entrada)": {
+      "main": [
+        [
+          {
+            "node": "Extrair NF-e",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair NF-e": {
+      "main": [
+        [
+          {
+            "node": "Buscar Regras",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar Regras": {
+      "main": [
+        [
+          {
+            "node": "Comparar Regras",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comparar Regras": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Processador de Lote",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Processador de Lote": {
+      "main": [
+        [
+          {
+            "node": "Gravar no Banco",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar no Banco": {
+      "main": [
+        [
+          {
+            "node": "Resumo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formulário de Revisão": {
+      "main": [
+        [
+          {
+            "node": "Registrar Revisão",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Toda madrugada": {
+      "main": [
+        [
+          {
+            "node": "Buscar NCMs pendentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar NCMs pendentes": {
+      "main": [
+        [
+          {
+            "node": "Montar lote",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar lote": {
+      "main": [
+        [
+          {
+            "node": "Sugerir regras",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sugerir regras": {
+      "main": [
+        [
+          {
+            "node": "Ler sugestões",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler sugestões": {
+      "main": [
+        [
+          {
+            "node": "Gravar sugestões",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

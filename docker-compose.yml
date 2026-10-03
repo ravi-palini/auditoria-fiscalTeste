@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  budibase:
+    image: budibase/budibase:latest
+    restart: unless-stopped
+    ports:
+      - "10000:8080"  # Budibase will be accessible at http://localhost:10000
+    environment:
+      # Budibase configuration
+      - DATABASE_URL=postgres://budibase:${POSTGRES_PASSWORD}@postgres_core:5432/budibase
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-changeme-in-production-use-32-char-key}
+      - APP_NAME=Auditoria Fiscal GUI
+      - APP_URL=http://localhost:10000
+      - CORS_ORIGIN=http://localhost:10000
+      - ROOT_URL=http://localhost:10000
+      # Disable telemetry if desired
+      - DISABLE_TELEMETRY=true
+    volumes:
+      - budibase_data:/budibase/data
+    networks:
+      - infra-core_default
+
+networks:
+  infra-core_default:
+    external: true
+
+volumes:
+  budibase_data:
